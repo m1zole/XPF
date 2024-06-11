@@ -1040,7 +1040,11 @@ static uint64_t xpf_find_thread_machine_contextData(void)
 		uint16_t imm = 0;
 		arm64_dec_add_imm(pfsec_read32(gXPF.kernelTextSection, vmaddr - 12), NULL, NULL, &imm);
 		machine_contextData = imm;
-		*stop = true;
+        if((machine_contextData == 0) && (strcmp(gXPF.xnuBuild, "10002.0.40.502.3~1") == 0)) {
+            arm64_dec_add_imm(pfsec_read32(gXPF.kernelTextSection, vmaddr - 16), NULL, NULL, &imm);
+            machine_contextData = imm;
+        }
+        *stop = true;
 	});
 	pfmetric_free(patternMetric);
 
