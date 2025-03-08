@@ -1,4 +1,4 @@
-#include <choma/FAT.h>
+#include <choma/Fat.h>
 #include <choma/MachO.h>
 #include <choma/PatchFinder.h>
 #include <choma/MachOByteOrder.h>
@@ -18,19 +18,44 @@ bool xpf_supported_always(void)
 	return true;
 }
 
+// iOS 15 and above
+bool xpf_supported_15up(void)
+{
+	return strcmp(gXPF.darwinVersion, "21.0.0") >= 0;
+}
+
+// iOS 15 and below
 bool xpf_supported_15down(void)
 {
 	return strcmp(gXPF.darwinVersion, "22.0.0") < 0;
 }
 
+// iOS 16 and above
 bool xpf_supported_16up(void)
 {
 	return strcmp(gXPF.darwinVersion, "22.0.0") >= 0;
 }
 
+// iOS 16 and below
+bool xpf_supported_16down(void)
+{
+	return strcmp(gXPF.darwinVersion, "23.0.0") < 0;
+}
+
+// iOS 15.x and 16.x
+bool xpf_supported_1516(void)
+{
+	return xpf_supported_15up() && xpf_supported_16down();
+}
+
 bool xpf_supported_arm64(void)
 {
 	return !gXPF.kernelIsArm64e;
+}
+
+bool xpf_arm64_kcall_supported(void)
+{
+	return xpf_supported_arm64() && xpf_supported_16down();
 }
 
 XPFSet gBaseSet = {
@@ -135,7 +160,7 @@ XPFSet gBadRecoverySet = {
 
 XPFSet gSandboxSet = {
 	.name="sandbox",
-	.supported=xpf_supported_always,
+	.supported=xpf_supported_15up,
 	.metrics={
 		"kernelConstant.nsysent",
 		"kernelConstant.mach_trap_count",
@@ -154,7 +179,7 @@ XPFSet gPhysRWSet = {
 
 XPFSet gPerfKRWSet = {
 	.name="perfkrw",
-	.supported=xpf_supported_always,
+	.supported=xpf_supported_1516,
 	.metrics={
 		"kernelSymbol.perfmon_dev_open",
 		"kernelSymbol.perfmon_devices",
@@ -175,7 +200,7 @@ XPFSet gDevModeSet = {
 
 XPFSet gArm64KcallSet = {
 	.name="arm64kcall",
-	.supported=xpf_supported_arm64,
+	.supported=xpf_arm64_kcall_supported,
 	.metrics={
 		"kernelSymbol.exception_return",
 		"kernelGadget.kcall_return",
@@ -242,7 +267,7 @@ int xpf_start_with_kernel_path(const char *kernelPath)
 		}
 	}
 
-	FAT *candidate = fat_init_from_memory_stream(stream);
+	Fat *candidate = fat_init_from_memory_stream(stream);
 	if (!candidate) {
 		xpf_set_error("Failed to load kernel macho");
 		return -1;
@@ -288,21 +313,10 @@ int xpf_start_with_kernel_path(const char *kernelPath)
 		gXPF.kernelPLKTextSection = xpf_pfsec_init(NULL, "__PLK_TEXT_EXEC", "__text");
 	}
 
-	gXPF.kernelBase = UINT64_MAX;
+	gXPF.kernelBase = macho_get_base_address(gXPF.kernel);
 	gXPF.kernelEntry = 0;
 	macho_enumerate_load_commands(gXPF.kernel, ^(struct load_command loadCommand, uint64_t offset, void *cmd, bool *stop) {
-		if (loadCommand.cmd == LC_SEGMENT_64) {
-			struct segment_command_64 *segCmd = (struct segment_command_64 *)cmd;
-			SEGMENT_COMMAND_64_APPLY_BYTE_ORDER(segCmd, LITTLE_TO_HOST_APPLIER);
-			if (segCmd->vmaddr < gXPF.kernelBase) {
-				if (strncmp(segCmd->segname, "__PRELINK", 9) != 0 
-					&& strncmp(segCmd->segname, "__PLK", 5) != 0) {
-					// PRELINK is before the actual base, but we don't care about it
-					gXPF.kernelBase = segCmd->vmaddr;
-				}
-			}
-		}
-		else if (loadCommand.cmd == LC_UNIXTHREAD) {
+		if (loadCommand.cmd == LC_UNIXTHREAD) {
 			uint8_t *cmdData = ((uint8_t *)cmd + sizeof(struct thread_command));
 			uint8_t *cmdDataEnd = ((uint8_t *)cmd + loadCommand.cmdsize);
 
@@ -319,6 +333,7 @@ int xpf_start_with_kernel_path(const char *kernelPath)
 				}
 				cmdData += (8 + count);
 			}
+			*stop = true;
 		}
 	});
 
@@ -493,7 +508,7 @@ xpc_object_t xpf_construct_offset_dictionary(const char *sets[])
 				break;
 			}
 			else {
-				if (j == (setCount-1)) {
+				if (j == (setCount-1) && gSets[j]->supported()) {
 					xpf_set_error("Failed to find set \"%s\"", sets[i]);
 					xpc_release(offsetDictionary);
 					return NULL;

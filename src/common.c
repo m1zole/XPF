@@ -334,17 +334,49 @@ static uint64_t xpf_find_allproc(void)
 	pfmetric_free(shutdownwaitMetric);
 
 	PFXrefMetric *shutdownwaitXrefMetric = pfmetric_xref_init(shutdownwaitString, XREF_TYPE_MASK_REFERENCE);
-	__block uint64_t shutdownwaitXref = 0;
+	__block uint64_t beforeLdrAddr = 0;
 	pfmetric_run(gXPF.kernelTextSection, shutdownwaitXrefMetric, ^(uint64_t vmaddr, bool *stop) {
-		shutdownwaitXref = vmaddr;
+		beforeLdrAddr = vmaddr;
 		*stop = true;
 	});
 	pfmetric_free(shutdownwaitXrefMetric);
 
+	arm64_register destinationReg;
+	if (arm64_dec_add_imm(pfsec_read32(gXPF.kernelTextSection, beforeLdrAddr), &destinationReg, NULL, NULL) != 0) return 0;
+
+	if (ARM64_REG_GET_NUM(destinationReg) != 3) {
+		// If the string is not loaded into x3, we need to advance until the mov x3, <target>
+
+		uint32_t targetInsn = 0, targetMask = 0;
+		arm64_gen_mov_reg(ARM64_REG_X(3), destinationReg, &targetInsn, &targetMask);
+
+		uint64_t curAddr = beforeLdrAddr;
+		for (int i = 0; i < 200; i++) {
+			uint32_t curInsn = pfsec_read32(gXPF.kernelTextSection, curAddr);
+
+			if ((curInsn & targetMask) == targetInsn) {
+				beforeLdrAddr = curAddr;
+				break;
+			}
+
+			// If we find an unconditional branch, follow it
+			uint64_t bTarget = 0;
+			bool isBl = false;
+			if (arm64_dec_b_l(curInsn, curAddr, &bTarget, &isBl) == 0) {
+				if (!isBl) {
+					curAddr = bTarget;
+					continue;
+				}
+			}
+
+			curAddr += 4;
+		}
+	}
+
 	uint32_t ldrAny = 0, ldrAnyMask = 0;
 	arm64_gen_ldr_imm(0, LDR_STR_TYPE_UNSIGNED, ARM64_REG_ANY, ARM64_REG_ANY, OPT_UINT64_NONE, &ldrAny, &ldrAnyMask);
 
-	uint64_t ldrAddr = pfsec_find_next_inst(gXPF.kernelTextSection, shutdownwaitXref, 20, ldrAny, ldrAnyMask);
+	uint64_t ldrAddr = pfsec_find_next_inst(gXPF.kernelTextSection, beforeLdrAddr, 20, ldrAny, ldrAnyMask);
 	return pfsec_arm64_resolve_adrp_ldr_str_add_reference_auto(gXPF.kernelTextSection, ldrAddr);
 }
 
@@ -360,6 +392,31 @@ static uint64_t xpf_find_task_crashinfo_release_ref(void)
 		*stop = true;
 	});
 	pfmetric_free(corpseReleasedMetric);
+
+	if (!corpseReleasedStringAddr) {
+		// iOS 14 does not have the above log string
+		corpseReleasedMetric = pfmetric_string_init("\"corpse in flight count over-release\"");
+		pfmetric_run(gXPF.kernelStringSection, corpseReleasedMetric, ^(uint64_t vmaddr, bool *stop){
+			corpseReleasedStringAddr = vmaddr;
+			*stop = true;
+		});
+		pfmetric_free(corpseReleasedMetric);
+
+		if (!corpseReleasedStringAddr) return 0;
+
+		// iOS 14 also does not have the movz after this panic, so we look for a ret instruction before (as task_crashinfo_release_ref should be the first xref).
+		PFXrefMetric *corseReleasedXrefMetric = pfmetric_xref_init(corpseReleasedStringAddr, XREF_TYPE_MASK_REFERENCE);
+		__block uint64_t task_crashinfo_release_ref = 0;
+		pfmetric_run(gXPF.kernelTextSection, corseReleasedXrefMetric, ^(uint64_t vmaddr, bool *stop) {
+			if (pfsec_find_prev_inst(gXPF.kernelTextSection, vmaddr, 20, 0xd65f03c0, 0xffffffff)) {
+				task_crashinfo_release_ref = pfsec_find_function_start(gXPF.kernelTextSection, vmaddr);
+				*stop = true;
+			}
+		});
+		pfmetric_free(corseReleasedXrefMetric);
+
+		return task_crashinfo_release_ref;
+	}
 
 	PFXrefMetric *corseReleasedXrefMetric = pfmetric_xref_init(corpseReleasedStringAddr, XREF_TYPE_MASK_REFERENCE);
 	__block uint64_t task_crashinfo_release_ref = 0;
@@ -387,71 +444,108 @@ static uint64_t xpf_find_task_collect_crash_info(void)
 			*stop = true;
 		}
 	});
+
+	if (!task_collect_crash_info) {
+		// On iOS 18, this call is followed by a mov w??, #0
+		pfmetric_run(gXPF.kernelTextSection, task_crashinfo_release_refXrefMetric, ^(uint64_t vmaddr, bool *stop) {
+			uint64_t imm = 0;
+			arm64_register reg;
+			arm64_dec_mov_imm(pfsec_read32(gXPF.kernelTextSection, vmaddr + 4), &reg, &imm, NULL, NULL);
+
+			if (imm == 0 && ARM64_REG_IS_W(reg)) {
+				task_collect_crash_info = pfsec_find_function_start(gXPF.kernelTextSection, vmaddr);
+				*stop = true;
+			}
+		});
+	}
+
 	pfmetric_free(task_crashinfo_release_refXrefMetric);
+
+	// Handle outlining on iOS 18.4+
+	// Bit hacky, but with a bit of wishful thinking it might stay like this
+	PFXrefMetric *task_collect_crash_infoOutlineMetric = pfmetric_xref_init(task_collect_crash_info, XREF_TYPE_MASK_JUMP);
+	pfmetric_run(gXPF.kernelTextSection, task_collect_crash_infoOutlineMetric, ^(uint64_t vmaddr, bool *stop) {
+		if ((vmaddr < task_collect_crash_info) && (vmaddr >= (task_collect_crash_info - (5 * sizeof(uint32_t))))) {
+			task_collect_crash_info = vmaddr - (2 * sizeof(uint32_t));
+			*stop = true;
+		}
+	});
+	pfmetric_free(task_collect_crash_infoOutlineMetric);
 
 	return task_collect_crash_info;
 }
 
 static uint64_t xpf_find_task_itk_space(void)
 {
-	uint64_t task_collect_crash_info = xpf_item_resolve("kernelSymbol.task_collect_crash_info");
+	__block uint64_t task_collect_crash_info = xpf_item_resolve("kernelSymbol.task_collect_crash_info");
 
 	uint32_t movzW2_1 = 0, movzW2_1Mask = 0;
 	arm64_gen_mov_imm('z', ARM64_REG_W(2), OPT_UINT64(1), OPT_UINT64(0), &movzW2_1, &movzW2_1Mask);
 
 	__block uint64_t itk_space = 0;
 	PFXrefMetric *task_collect_crash_infoXrefMetric = pfmetric_xref_init(task_collect_crash_info, XREF_TYPE_MASK_CALL);
+	__block uint64_t task_collect_crash_infoXref = 0;
+
 	pfmetric_run(gXPF.kernelTextSection, task_collect_crash_infoXrefMetric, ^(uint64_t vmaddr, bool *stop) {
 		if ((pfsec_read32(gXPF.kernelTextSection, vmaddr - 4) & movzW2_1Mask) != movzW2_1) return;
 
-		// At vmaddr + 4 there is a CBZ to some other place
-		// At that place, the next CBZ leads to the place where the actual reference we want is
-
-		uint64_t cbz1Addr = vmaddr + 4;
-		bool isCbnz = false;
-		uint64_t target1 = 0;
-		if (arm64_dec_cb_n_z(pfsec_read32(gXPF.kernelTextSection, cbz1Addr), cbz1Addr, &isCbnz, NULL, &target1) != 0) {
-			xpf_set_error("itk_space error: first branch is not cbz");
-			*stop = true;
-		}
-		if (isCbnz) {
-			// If this is not a cbz and rather a cbnz, treat the instruction after it as the cbz target
-			target1 = cbz1Addr + 4;
-		}
-
-		uint32_t cbzAnyInst = 0, cbzAnyMask = 0;
-		arm64_gen_cb_n_z(OPT_BOOL_NONE, ARM64_REG_ANY, OPT_UINT64_NONE, &cbzAnyInst, &cbzAnyMask);
-
-		uint64_t cbz2Addr = pfsec_find_next_inst(gXPF.kernelTextSection, target1, 0x20, cbzAnyInst, cbzAnyMask);
-
-		uint64_t target2 = 0;
-		if (arm64_dec_cb_n_z(pfsec_read32(gXPF.kernelTextSection, cbz2Addr), cbz2Addr, &isCbnz, NULL, &target2) != 0) {
-			xpf_set_error("itk_space error: second branch not found");
-			*stop = true;
-		}
-		if (isCbnz) {
-			// If this is not a cbz and rather a cbnz, treat the instruction after it as the cbz target
-			target2 = cbz2Addr + 4;
-		}
-
-		uint32_t ldrAnyInst = 0, ldrAnyMask = 0;
-		arm64_gen_ldr_imm(0, LDR_STR_TYPE_UNSIGNED, ARM64_REG_ANY, ARM64_REG_ANY, OPT_UINT64_NONE, &ldrAnyInst, &ldrAnyMask);
-
-		// At this place, the first ldr that doesn't read from SP has the reference we want
-		uint64_t ldrAddr = target2;
-		while (true) {
-			ldrAddr = pfsec_find_next_inst(gXPF.kernelTextSection, ldrAddr+4, 0, ldrAnyInst, ldrAnyMask);
-			arm64_register addrReg;
-			uint64_t imm = 0;
-			arm64_dec_ldr_imm(pfsec_read32(gXPF.kernelTextSection, ldrAddr), NULL, &addrReg, &imm, NULL, NULL);
-			if (ARM64_REG_GET_NUM(addrReg) != ARM64_REG_NUM_SP) {
-				itk_space = imm;
-				*stop = true;
-				break;
-			}
-		}
+		task_collect_crash_infoXref = vmaddr;
+		*stop = true;
 	});
 	pfmetric_free(task_collect_crash_infoXrefMetric);
+
+	if (!task_collect_crash_infoXref) {
+		xpf_set_error("itk_space error: Unable to find task_collect_crash_info (%#llx) xref", task_collect_crash_info);
+		return 0;
+	}
+
+	// At vmaddr + 4 there is a CBZ to some other place
+	// At that place, the next CBZ leads to the place where the actual reference we want is
+
+	uint64_t cbz1Addr = task_collect_crash_infoXref + 4;
+	bool isCbnz = false;
+	uint64_t target1 = 0;
+	if (arm64_dec_cb_n_z(pfsec_read32(gXPF.kernelTextSection, cbz1Addr), cbz1Addr, &isCbnz, NULL, &target1) != 0) {
+		xpf_set_error("itk_space error: first branch is not cbz");
+		return 0;
+	}
+	if (isCbnz) {
+		// If this is not a cbz and rather a cbnz, treat the instruction after it as the cbz target
+		target1 = cbz1Addr + 4;
+	}
+
+	uint32_t cbzAnyInst = 0, cbzAnyMask = 0;
+	arm64_gen_cb_n_z(OPT_BOOL_NONE, ARM64_REG_ANY, OPT_UINT64_NONE, &cbzAnyInst, &cbzAnyMask);
+
+	uint64_t cbz2Addr = pfsec_find_next_inst(gXPF.kernelTextSection, target1, 0x20, cbzAnyInst, cbzAnyMask);
+
+	uint64_t target2 = 0;
+	if (arm64_dec_cb_n_z(pfsec_read32(gXPF.kernelTextSection, cbz2Addr), cbz2Addr, &isCbnz, NULL, &target2) != 0) {
+		xpf_set_error("itk_space error: second branch not found");
+		return 0;
+	}
+	if (isCbnz) {
+		// If this is not a cbz and rather a cbnz, treat the instruction after it as the cbz target
+		target2 = cbz2Addr + 4;
+	}
+
+	uint32_t ldrAnyInst = 0, ldrAnyMask = 0;
+	arm64_gen_ldr_imm(0, LDR_STR_TYPE_UNSIGNED, ARM64_REG_ANY, ARM64_REG_ANY, OPT_UINT64_NONE, &ldrAnyInst, &ldrAnyMask);
+
+	// At this place, the first ldr that doesn't read from SP has the reference we want
+	uint64_t ldrAddr = target2;
+	uint64_t ldrEndAddr = ldrAddr + (20 * sizeof(uint32_t));
+	while (true) {
+		ldrAddr = pfsec_find_next_inst(gXPF.kernelTextSection, ldrAddr, (ldrEndAddr - ldrAddr) / 4, ldrAnyInst, ldrAnyMask);
+		arm64_register addrReg;
+		uint64_t imm = 0;
+		arm64_dec_ldr_imm(pfsec_read32(gXPF.kernelTextSection, ldrAddr), NULL, &addrReg, &imm, NULL, NULL);
+		if (ARM64_REG_GET_NUM(addrReg) != ARM64_REG_NUM_SP) {
+			itk_space = imm;
+			break;
+		}
+		ldrAddr += 4;
+	}
 
 	return itk_space;
 }
@@ -499,6 +593,15 @@ static uint64_t xpf_find_vm_map_pmap(void)
 		*stop = true;
 	});
 	pfmetric_free(stringMetric);
+
+	if (!stringAddr) {
+		// Slightly different on iOS 14
+		stringMetric = pfmetric_string_init("\"userspace has control access to a \" \"kernel map %p through task %p\"");
+		pfmetric_run(gXPF.kernelStringSection, stringMetric, ^(uint64_t vmaddr, bool *stop){
+			stringAddr = vmaddr;
+			*stop = true;
+		});
+	}
 
 	PFXrefMetric *xrefMetric = pfmetric_xref_init(stringAddr, XREF_TYPE_MASK_REFERENCE);
 	__block uint64_t xrefAddr = 0;
@@ -958,10 +1061,24 @@ static uint64_t xpf_find_thread_machine_CpuDatap(void)
 	});
 	pfmetric_free(stringMetric);
 
+	if (!stringAddr) {
+		stringMetric = pfmetric_string_init("\"kernel_debug_early_end() not call on boot processor\"");
+		pfmetric_run(gXPF.kernelStringSection, stringMetric, ^(uint64_t vmaddr, bool *stop) {
+			stringAddr = vmaddr;
+			*stop = true;
+		});
+		pfmetric_free(stringMetric);
+	}
+
 	__block uint64_t panicBranch = 0;
 	PFXrefMetric *xrefMetric = pfmetric_xref_init(stringAddr, XREF_TYPE_MASK_REFERENCE);
 	pfmetric_run(gXPF.kernelTextSection, xrefMetric, ^(uint64_t vmaddr, bool *stop) {
-		panicBranch = vmaddr - (5 * sizeof(uint32_t));
+		if (strcmp(gXPF.darwinVersion, "21.0.0") < 0) {
+			// On iOS 14 the branch xref is to the adrp before the panic call 
+			panicBranch = vmaddr - (sizeof(uint32_t));
+		} else {
+			panicBranch = vmaddr - (5 * sizeof(uint32_t));
+		}
 		*stop = true;
 	});
 	pfmetric_free(xrefMetric);

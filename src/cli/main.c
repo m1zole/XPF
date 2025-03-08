@@ -18,18 +18,26 @@ int main(int argc, char *argv[]) {
 			char *sets[] = {
 				"translation",
 				"trustcache",
-				"sandbox",
 				"physmap",
 				"struct",
 				"physrw",
-				"perfkrw",
+				NULL,
+				NULL,
 				NULL,
 				NULL,
 				NULL,
 				NULL,
 			};
 
-			uint32_t idx = 7;
+			uint32_t idx = 0;
+			while (sets[idx] != NULL) idx++;
+
+			if (xpf_set_is_supported("sandbox")) {
+				sets[idx++] = "sandbox";
+			}
+			if (xpf_set_is_supported("perfkrw")) {
+				sets[idx++] = "perfkrw";
+			}
 			if (xpf_set_is_supported("devmode")) {
 				sets[idx++] = "devmode"; 
 			}
